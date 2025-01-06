@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+
+function check_dependencies() {
+	local dependencies=("op" "jq" "ssh-add" "ssh-keygen")
+	for cmd in "${dependencies[@]}"; do
+		if ! command -v "$cmd" &>/dev/null; then
+			echo "Error: $cmd is not installed. Please install it and try again." >/dev/stderr
+			exit 1
+		fi
+	done
+}
+
+function clean_ssh_agent() {
+	# Clean up orphaned SSH agents
+	while read -r dir; do
+		sock="$(ls $dir/agent.*)"
+		pid=$(pgrep -u "$USER" ssh-agent)
+		if [[ "$sock" != "$dir/agent.$((pid - 1))" ]]; then
+			echo "$sock is an orphan socket! Cleaning $dir..."
+			rm -rf "$dir"
+		fi
+	done < <(find /tmp -maxdepth 1 -type d -name "ssh-*" -user "$USER")
+}
+
+function setup_ssh_agent() {
+	clean_ssh_agent
+
+	local pid=0
+	pid=$(pgrep -u "$USER" ssh-agent | tail -n 1)
+
+	local sock=""
+	local tmpsock
+	if [[ -n $pid ]]; then
+		while read -r dir; do
+			tmpsock="$(ls $dir/agent.*)"
+			if [[ "$tmpsock" = "$dir/agent.$((pid - 1))" && -S $tmpsock ]]; then
+				sock=$tmpsock
+				break
+			else
+				echo "else"
+			fi
+		done < <(find /tmp -maxdepth 1 -type d -name "ssh-*" -user "$USER")
+
+		if [[ ! -z "$sock" ]]; then
+			export SSH_AGENT_PID=$pid
+			export SSH_AUTH_SOCK=$sock
+		else
+			kill -9 $pid
+			pid=0
+		fi
+	fi
+
+	if [[ $pid -eq 0 ]]; then
+		echo "Starting ssh-agent..."
+		eval "$(ssh-agent -s)" > /dev/null
+		export SSH_AGENT_PID
+		export SSH_AUTH_SOCK
+	fi
+
+	if [[ -n "${SSH_AGENT_PID+x}" && -n "${SSH_AUTH_SOCK+x}" ]]; then
+		local session_file="$HOME/.op-session"
+		if [[ -f $session_file ]]; then
+			if ! grep SSH_AGENT_PID $session_file >/dev/null; then
+				echo "export SSH_AGENT_PID=\"$SSH_AGENT_PID\"" >> "$session_file"
+			fi
+			if ! grep SSH_AUTH_SOCK $session_file >/dev/null; then
+				echo "export SSH_AUTH_SOCK=\"$SSH_AUTH_SOCK\"" >> "$session_file"
+			fi
+		fi
+	fi
+}
+
+function connect_to_1password() {
+	# Detect the shorthand dynamically
+	local shorthand
+	local userid
+	shorthand=$(op account list --format json | jq -r '.[0].shorthand')
+	userid=$(op account list --format json | jq -r '.[0].user_uuid')
+	if [[ -z "$shorthand" || -z "$userid" ]]; then
+		echo "Error: No 1Password account found. Please add your account with 'op account add'." >/dev/stderr
+		exit 1
+	fi
+
+	local session_token_var
+	local session_token
+	session_token_var=OP_SESSION_$userid
+	session_token=${!session_token_var}
+
+	local session_file="$HOME/.op-session"
+	# Check if the session token exists and is valid
+	if [[ -f "$session_file" ]]; then
+		source "$session_file" > /dev/null
+		if op vault list &> /dev/null; then
+			return
+		else
+			if [[ "$(env | grep ${session_token_var}=)" != "" ]]; then
+				unset $session_token_var
+			fi
+			if [[ "$(env | grep OP_SESSION=)" != "" ]]; then
+				unset OP_SESSION
+			fi
+			echo "1Password session has expired or is invalid. Signing in again..." >/dev/stderr
+		fi
+	fi
+
+	# Prompt the user for their master password
+	echo -n "Enter your 1Password (shorthand: $shorthand) master password: "
+	read -s master_password
+	echo
+
+	# Sign in and capture the session token
+	eval $(echo "$master_password" | op signin --account "$shorthand")
+	session_token=${!session_token_var}
+	if [[ $? -ne 0 || -z "$session_token" ]]; then
+		echo "Error: Failed to sign in to 1Password. Please check your credentials." >/dev/stderr
+		exit 1
+	fi
+
+	# Save the session token in a sourceable format
+	echo "export OP_SESSION_$userid=\"$session_token\"" > "$session_file"
+	chmod 600 "$session_file"
+
+	echo "1Password session established and saved."
+}
+
+function list_keys() {
+	local keys secure_notes
+
+	keys=$(op item list --categories="SSH Key" --format json | jq -r '.[] | select(.id != null) | .id + " " + .title')
+	secure_notes=$(op item list --categories="Secure Note" --format json | jq -r '.[] | select(.title | contains("[SSH")) | .id + " " + .title')
+	keys=$(echo -e "$keys\n$secure_notes" | sed -e '/^$/d' | sort -k2)
+
+	if [[ -z "$keys" ]]; then
+		echo "No SSH keys found in 1Password." >/dev/stderr
+		exit 1
+	fi
+
+	local keys_array=()
+	for key in "$keys"; do
+		keys_array+=("$key")
+	done
+
+	echo "${keys_array[@]}"
+}
+
+function get_key_id() {
+	local id=$1
+	local keys secure_notes key_id
+
+	keys=$(op item list --categories="SSH Key" --format json | jq -r '.[] | select(.id != null) | .id + " " + .title')
+	secure_notes=$(op item list --categories="Secure Note" --format json | jq -r '.[] | select(.title | contains("[SSH")) | .id + " " + .title')
+	keys=$(echo -e "$keys\n$secure_notes" | sed -e '/^$/d')
+	key_id=$(echo "$keys" | awk -v id="$id" '$1 == id {print $1}')
+
+	if [[ -z "$key_id" ]]; then
+		echo "Invalid ID: $id" >/dev/stderr
+		exit 1
+	fi
+	echo "$key_id"
+}
+
+function add_key_to_agent() {
+	connect_to_1password
+	setup_ssh_agent
+
+	local id=$1
+	local key_id=$(get_key_id "$id")
+
+	local ssh_key
+	ssh_key=$(op item get "$key_id" --fields private_key --reveal 2>/dev/null | sed -e 's/^"//;s/"$//' -e '/^$/d')
+	if [[ -z "$ssh_key" ]]; then
+		echo "Error: Unable to retrieve the private key for ID $id." >/dev/stderr
+		exit 1
+	fi
+
+	ssh-add <(echo "$ssh_key") > /dev/null 2>&1
+	if [[ $? -ne 0 ]]; then
+		echo "Error: Failed to add the SSH key to the agent." >/dev/stderr
+		exit 1
+	fi
+	echo "SSH key ID $id added to the agent."
+}
+
+function extract_key() {
+	connect_to_1password
+
+	local id=$1
+	local field=$2
+	local key_id=$(get_key_id "$id")
+
+	local key
+	key=$(op item get "$key_id" --fields "$field" --reveal 2>/dev/null | sed -e 's/^"//;s/"$//' -e '/^$/d')
+	if [[ -z "$key" ]]; then
+		echo "Error: Unable to retrieve the field $field for ID $id." >/dev/stderr
+		exit 1
+	fi
+	echo "$key"
+}
+
+function lock_and_logout() {
+	echo "Stopping ssh-agent..."
+	ssh-agent -k > /dev/null 2>&1 || echo "No active SSH agent found."
+
+	echo "Signing out from 1Password..."
+	op signout > /dev/null 2>&1 || echo "No active 1Password session found."
+
+	rm -f $HOME/.op-session
+
+	echo "All sessions closed and cleaned up."
+}
+
+function print_help() {
+	echo "Usage: $0 <action> [--id <ID>] (--all) [--field <field>]"
+	echo "Actions:"
+	echo "	list					- List SSH keys"
+	echo "	add --id <ID> (or --all)		- Add an SSH key to the agent"
+	echo "	    --all				- Add all found SSH keys to the agent"
+	echo "	extract --id <ID> --field <field>	- Extract a specific field of a key"
+	echo "	lock|logout|signout			- Lock the SSH agent and sign out of 1Password"
+	echo "	--help					- Show this help message"
+}
+
+if [[ $# -lt 1 ]]; then
+	print_help
+	exit 1
+fi
+
+check_dependencies
+
+action=$1
+all_flag=0
+shift
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		--id)
+			id=$2
+			shift
+			;;
+		--all)
+			all_flag=1
+			shift
+			;;
+		--field)
+			field=$2
+			shift
+			;;
+		--help)
+			print_help
+			exit 0
+			;;
+		*)
+			echo "Unknown argument: $1" >/dev/stderr
+			exit 1
+			;;
+	esac
+	shift
+done
+
+case $action in
+	list)
+		connect_to_1password
+
+		id=""
+		title=""
+		while IFS= read -r line; do
+			id="$(echo "$line" | cut -d' ' -f1)"
+			title="$(echo "$line" | cut -d' ' -f2-)"
+			echo "$title (ID: $id)"
+		done <<< "$(list_keys)"
+		;;
+	add)
+		if [[ $all_flag -eq 1 ]]; then
+			connect_to_1password
+
+			while IFS= read -r line; do
+				add_key_to_agent "$(echo "$line" | cut -d' ' -f1)"
+			done <<< "$(list_keys)"
+		else
+			if [[ -z $id ]]; then
+				echo "Error: --id (or --all) is required for the add action." >/dev/stderr
+				exit 1
+			fi
+			add_key_to_agent "$id"
+		fi
+		;;
+	extract)
+		if [[ -z $id || -z $field ]]; then
+			echo "Error: --id and --field are required for the extract action." >/dev/stderr
+			exit 1
+		fi
+		extract_key "$id" "$field"
+		;;
+	lock|logout|signout)
+		lock_and_logout
+		;;
+	--help)
+		print_help
+		;;
+	*)
+		echo "Unknown action: $action" >/dev/stderr
+		exit 1
+		;;
+esac
