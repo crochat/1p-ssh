@@ -14,7 +14,7 @@ function clean_ssh_agent() {
 	# Clean up orphaned SSH agents
 	while read -r dir; do
 		sock="$(ls $dir/agent.*)"
-		pid=$(pgrep -u "$USER" ssh-agent)
+		pid=$(ps auxf | grep "^$USER.*ssh-agent -s$" | awk '{print $2}')
 		if [[ "$sock" != "$dir/agent.$((pid - 1))" ]]; then
 			echo "$sock is an orphan socket! Cleaning $dir..."
 			rm -rf "$dir"
