@@ -23,51 +23,32 @@ function clean_ssh_agent() {
 }
 
 function setup_ssh_agent() {
-	clean_ssh_agent
+	local session_file="$HOME/.op-session"
+	local agent_status
 
-	local pid=0
-	pid=$(pgrep -u "$USER" ssh-agent | tail -n 1)
+	ssh-add -l >/dev/null 2>&1
+	agent_status=$?
 
-	local sock=""
-	local tmpsock
-	if [[ -n $pid ]]; then
-		while read -r dir; do
-			tmpsock="$(ls $dir/agent.*)"
-			if [[ "$tmpsock" = "$dir/agent.$((pid - 1))" && -S $tmpsock ]]; then
-				sock=$tmpsock
-				break
-			else
-				echo "else"
-			fi
-		done < <(find /tmp -maxdepth 1 -type d -name "ssh-*" -user "$USER")
+	if [[ $agent_status -eq 2 ]]; then
+		unset SSH_AGENT_PID
+		unset SSH_AUTH_SOCK
 
-		if [[ ! -z "$sock" ]]; then
-			export SSH_AGENT_PID=$pid
-			export SSH_AUTH_SOCK=$sock
-		else
-			kill -9 $pid
-			pid=0
-		fi
-	fi
-
-	if [[ $pid -eq 0 ]]; then
 		echo "Starting ssh-agent..."
-		eval "$(ssh-agent -s)" > /dev/null
-		export SSH_AGENT_PID
-		export SSH_AUTH_SOCK
+		eval "$(ssh-agent -s)" >/dev/null
 	fi
 
-	if [[ -n "${SSH_AGENT_PID+x}" && -n "${SSH_AUTH_SOCK+x}" ]]; then
-		local session_file="$HOME/.op-session"
-		if [[ -f $session_file ]]; then
-			if ! grep SSH_AGENT_PID $session_file >/dev/null; then
-				echo "export SSH_AGENT_PID=\"$SSH_AGENT_PID\"" >> "$session_file"
-			fi
-			if ! grep SSH_AUTH_SOCK $session_file >/dev/null; then
-				echo "export SSH_AUTH_SOCK=\"$SSH_AUTH_SOCK\"" >> "$session_file"
-			fi
-		fi
-	fi
+	touch "$session_file"
+	chmod 600 "$session_file"
+
+	sed -i \
+		-e '/^export SSH_AGENT_PID=/d' \
+		-e '/^export SSH_AUTH_SOCK=/d' \
+		"$session_file"
+
+	{
+		echo "export SSH_AGENT_PID=\"$SSH_AGENT_PID\""
+		echo "export SSH_AUTH_SOCK=\"$SSH_AUTH_SOCK\""
+	} >> "$session_file"
 }
 
 function connect_to_1password() {
@@ -160,24 +141,24 @@ function get_key_id() {
 }
 
 function add_key_to_agent() {
-	connect_to_1password
-	setup_ssh_agent
-
 	local id=$1
 	local key_id=$(get_key_id "$id")
-
 	local ssh_key
+
 	ssh_key=$(op item get "$key_id" --fields private_key --reveal 2>/dev/null | sed -e 's/^"//;s/"$//' -e '/^$/d')
+
 	if [[ -z "$ssh_key" ]]; then
 		echo "Error: Unable to retrieve the private key for ID $id." >/dev/stderr
 		exit 1
 	fi
 
-	ssh-add <(echo "$ssh_key") > /dev/null 2>&1
+	ssh-add <(echo "$ssh_key") >/dev/null 2>&1
+
 	if [[ $? -ne 0 ]]; then
 		echo "Error: Failed to add the SSH key to the agent." >/dev/stderr
 		exit 1
 	fi
+
 	echo "SSH key ID $id added to the agent."
 }
 
@@ -198,8 +179,18 @@ function extract_key() {
 }
 
 function lock_and_logout() {
+	local session_file="$HOME/.op-session"
+
 	echo "Stopping ssh-agent..."
-	ssh-agent -k > /dev/null 2>&1 || echo "No active SSH agent found."
+	if [[ -f "$session_file" ]]; then
+		source "$session_file" >/dev/null
+	fi
+
+	if [[ -n "$SSH_AGENT_PID" ]]; then
+		eval "$(ssh-agent -k)" >/dev/null 2>&1 || echo "No active SSH agent found."
+	else
+		echo "No active SSH agent found."
+	fi
 
 	echo "Signing out from 1Password..."
 	op signout > /dev/null 2>&1 || echo "No active 1Password session found."
@@ -270,17 +261,27 @@ case $action in
 		done <<< "$(list_keys)"
 		;;
 	add)
-		if [[ $all_flag -eq 1 ]]; then
-			connect_to_1password
+		connect_to_1password
+		setup_ssh_agent
 
+		if [[ $all_flag -eq 1 ]]; then
+			pids=()
 			while IFS= read -r line; do
-				add_key_to_agent "$(echo "$line" | cut -d' ' -f1)"
+				add_key_to_agent "$(echo "$line" | cut -d' ' -f1)" &
+				pids+=($!)
 			done <<< "$(list_keys)"
+
+			status=0
+			for pid in "${pids[@]}"; do
+				wait "$pid" || status=1
+			done
+			exit $status
 		else
 			if [[ -z $id ]]; then
 				echo "Error: --id (or --all) is required for the add action." >/dev/stderr
 				exit 1
 			fi
+
 			add_key_to_agent "$id"
 		fi
 		;;
