@@ -51,14 +51,14 @@ In your .bashrc, you can add the following:
 source <(op completion bash)
 if [[ -f ~/.op-session ]]; then
 	if [[ -S ${SSH_AUTH_SOCK:-} ]]; then
-		_session_ssh_auth_sock=$SSH_AUTH_SOCK
+		_session_ssh_auth_sock=${SSH_AUTH_SOCK}
 		_session_ssh_agent_pid=${SSH_AGENT_PID-}
 	fi
 	source ~/.op-session
 	if [[ -n ${_session_ssh_auth_sock:-} ]]; then
-		export $SSH_AUTH_SOCK=$_session_ssh_auth_sock
-		if [[ -n $_session_ssh_agent_pid ]]; then
-			export SSH_AGENT_PID=$_session_ssh_agent_pid
+		export SSH_AUTH_SOCK=${_session_ssh_auth_sock}
+		if [[ -n ${_session_ssh_agent_pid} ]]; then
+			export SSH_AGENT_PID=${_session_ssh_agent_pid}
 		else
 			unset SSH_AGENT_PID
 		fi
